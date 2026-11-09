@@ -1,0 +1,1778 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Runtime.InteropServices;
+namespace WinFormsApp5
+{
+    public partial class Form1 : Form
+    {
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+        private static extern int SetWindowTheme(IntPtr hWnd, string? subAppName, string? subIdList);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool EnumChildWindows(IntPtr hWnd, EnumChildProc callback, IntPtr lParam);
+
+        private delegate bool EnumChildProc(IntPtr hWnd, IntPtr lParam);
+
+        private readonly Dictionary<string, ProcessTracker> trackedProcesses = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, bool> displayedProcessStates = new(StringComparer.OrdinalIgnoreCase);
+        private System.Windows.Forms.Timer refreshTimer; // обновляет интерфейс раз в секунду
+        private System.Windows.Forms.Timer checkTimer; // проверяет каждую секунду запущены ли процессы
+        private System.Windows.Forms.Timer? autoSaveTimer;
+        private Label lblStatus;
+        private SmoothListBox lstProcesses;
+        private ContextMenuStrip processContextMenu;
+
+        private Button btnAddProcess;
+        private Button btnRemoveProcess;
+        private Button btnStart;
+        private Button btnStop;
+        private Button btnTheme;
+
+        private DataGridView dgvStats; // Таблица со статистикой
+        private Label lblTotalTimeValue;
+        private Label lblActiveAppsValue;
+        private bool isTracking = false;
+        private bool isDarkTheme = true;
+        private string dataFile = "tracker_data.txt";
+        private DateTime lastDetailedUiUpdate = DateTime.MinValue;
+        private readonly Dictionary<DateTime, double> usageByHour = new();
+        private readonly Dictionary<DateTime, Dictionary<string, double>> usageByAppHour = new();
+        private readonly List<Button> usagePeriodButtons = new();
+        private string usagePeriod = "Сегодня";
+        private const string UsageHistoryFormatMarker = "#elapsed-union-v2";
+        private DateTime? lastUsageSampleUtc;
+        private string[] lastSampleActiveProcesses = Array.Empty<string>();
+        private Panel? usageChart;
+        private Label? lblUsageSummary;
+        private readonly string usageHistoryFile = "usage_history.txt";
+
+        public Form1()
+        {
+            InitializeComponent();
+            InitializeControls();
+            DoubleBuffered = true;
+            SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+            ApplyTheme();
+            LoadAllData();
+        }
+
+        private void InitializeControls()
+        {
+            Color background = Color.FromArgb(7, 17, 26);
+            Color panel = Color.FromArgb(14, 26, 38);
+            Color surface = Color.FromArgb(22, 35, 48);
+            Color surface2 = Color.FromArgb(29, 46, 61);
+            Color ink = Color.FromArgb(232, 239, 246);
+            Color muted = Color.FromArgb(150, 167, 183);
+            Color accent = Color.FromArgb(38, 191, 191);
+            Color accent2 = Color.FromArgb(65, 224, 214);
+            Color grid = Color.FromArgb(54, 73, 89);
+            Color danger = Color.FromArgb(233, 93, 110);
+            Color dangerBg = Color.FromArgb(64, 34, 43);
+            Color statusGreen = Color.FromArgb(88, 195, 118);
+            Color cardTitle = Color.FromArgb(240, 245, 248);
+            Color rowEven = Color.FromArgb(24, 38, 50);
+            Color rowActive = Color.FromArgb(22, 57, 54);
+
+            Size = new Size(1400, 820);
+            MinimumSize = new Size(1100, 720);
+            Text = "Монитор времени";
+            StartPosition = FormStartPosition.CenterScreen;
+            BackColor = background;
+            Font = new Font("Segoe UI", 9F);
+
+            var root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                Padding = new Padding(18, 14, 18, 14),
+                ColumnCount = 1,
+                RowCount = 2,
+                Margin = Padding.Empty
+            };
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 94));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+            var header = new Panel { Dock = DockStyle.Fill, BackColor = background, Padding = new Padding(0) };
+            var title = new Label
+            {
+                Text = "Монитор времени",
+                Font = new Font("Segoe UI", 28F, FontStyle.Bold),
+                ForeColor = ink,
+                AutoSize = true,
+                Location = new Point(0, 24)
+            };
+            var subtitle = new Label
+            {
+                Text = "Отслеживание активности приложений",
+                Font = new Font("Segoe UI", 11F),
+                ForeColor = muted,
+                AutoSize = true,
+                Location = new Point(6, 70)
+            };
+
+            btnTheme = new Button
+            {
+                Size = new Size(42, 42),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.Transparent,
+                ForeColor = ink,
+                Cursor = Cursors.Hand,
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                Location = new Point(0, 18)
+            };
+            btnTheme.FlatAppearance.BorderSize = 0;
+            btnTheme.Paint += ThemeButton_Paint;
+            btnTheme.Click += (_, _) =>
+            {
+                isDarkTheme = !isDarkTheme;
+                ApplyTheme();
+                ApplyNativeControlTheme();
+            };
+
+            var headerAction = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                BackColor = Color.Transparent,
+                Location = new Point(0, 26)
+            };
+            headerAction.Controls.Add(btnTheme);
+            header.Controls.Add(title);
+            header.Controls.Add(subtitle);
+            header.Controls.Add(headerAction);
+            root.Controls.Add(header, 0, 0);
+
+            var content = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 2,
+                RowCount = 1,
+                Margin = Padding.Empty
+            };
+            content.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 35F));
+            content.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 65F));
+            root.Controls.Add(content, 0, 1);
+
+            var sidebar = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 1,
+                RowCount = 3,
+                Margin = Padding.Empty,
+                Padding = new Padding(0, 0, 14, 0)
+            };
+            sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 128));
+            sidebar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 118));
+            content.Controls.Add(sidebar, 0, 0);
+
+            var addCard = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = surface,
+                Margin = new Padding(0, 0, 0, 12),
+                Padding = new Padding(14, 12, 14, 12)
+            };
+            addCard.Tag = "surface";
+            var addLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 2,
+                Margin = Padding.Empty
+            };
+            addLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            addLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+            var addTitle = new Label
+            {
+                Text = "📦  Добавить приложение",
+                Dock = DockStyle.Fill,
+                Font = new Font("Segoe UI", 12F, FontStyle.Bold),
+                ForeColor = cardTitle,
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+            btnAddProcess = new Button
+            {
+                Text = "➕  Добавить в список",
+                Dock = DockStyle.Fill,
+                BackColor = accent,
+                ForeColor = Color.FromArgb(13, 25, 35),
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 10F, FontStyle.Bold),
+                Cursor = Cursors.Hand,
+                Margin = new Padding(0, 2, 0, 0)
+            };
+            btnAddProcess.FlatAppearance.BorderSize = 0;
+            btnAddProcess.FlatAppearance.MouseOverBackColor = accent2;
+            btnAddProcess.Click += BtnAddProcess_Click;
+            addLayout.Controls.Add(addTitle, 0, 0);
+            addLayout.Controls.Add(btnAddProcess, 0, 1);
+            addCard.Controls.Add(addLayout);
+            sidebar.Controls.Add(addCard, 0, 0);
+
+            var listCard = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = surface,
+                Margin = new Padding(0, 0, 0, 12),
+                Padding = new Padding(16, 14, 16, 12)
+            };
+            listCard.Tag = "surface";
+            var listLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 3,
+                Margin = Padding.Empty
+            };
+            listLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+            listLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            listLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+            var listTitle = new Label
+            {
+                Text = "🧩  Отслеживаемые приложения",
+                Dock = DockStyle.Fill,
+                Font = new Font("Segoe UI", 12F, FontStyle.Bold),
+                ForeColor = cardTitle,
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+            lstProcesses = new SmoothListBox
+            {
+                Dock = DockStyle.Fill,
+                BorderStyle = BorderStyle.None,
+                BackColor = surface,
+                ForeColor = ink,
+                SelectionMode = SelectionMode.One,
+                IntegralHeight = false,
+                ItemHeight = 30,
+                Margin = new Padding(0, 8, 0, 12),
+                Font = new Font("Segoe UI", 10F),
+                DrawMode = DrawMode.OwnerDrawFixed
+            };
+            lstProcesses.DrawItem += LstProcesses_DrawItem;
+            lstProcesses.MouseDown += LstProcesses_MouseDown;
+            processContextMenu = new ContextMenuStrip();
+            processContextMenu.Items.Add("Удалить приложение", null, (_, _) => BtnRemoveProcess_Click(this, EventArgs.Empty));
+            lstProcesses.ContextMenuStrip = processContextMenu;
+            btnRemoveProcess = new Button
+            {
+                Text = "🗑️  Удалить выбранное",
+                Dock = DockStyle.Fill,
+                BackColor = dangerBg,
+                ForeColor = danger,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 10F, FontStyle.Bold),
+                Cursor = Cursors.Hand,
+                Margin = new Padding(0, 0, 0, 0)
+            };
+            btnRemoveProcess.FlatAppearance.BorderSize = 0;
+            btnRemoveProcess.FlatAppearance.MouseOverBackColor = Color.FromArgb(92, 46, 55);
+            btnRemoveProcess.Click += BtnRemoveProcess_Click;
+            listLayout.Controls.Add(listTitle, 0, 0);
+            listLayout.Controls.Add(lstProcesses, 0, 1);
+            listLayout.Controls.Add(btnRemoveProcess, 0, 2);
+            listCard.Controls.Add(listLayout);
+            sidebar.Controls.Add(listCard, 0, 1);
+
+            var actionsCard = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = surface,
+                Padding = new Padding(14, 12, 14, 10)
+            };
+            actionsCard.Tag = "surface";
+            var actionsLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 2,
+                Margin = Padding.Empty
+            };
+            actionsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+            actionsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+            actionsLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+            actionsLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            btnStart = new Button
+            {
+                Text = "▶️  НАЧАТЬ",
+                Dock = DockStyle.Fill,
+                BackColor = accent,
+                ForeColor = Color.FromArgb(7, 18, 26),
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 10F, FontStyle.Bold),
+                Margin = new Padding(0, 0, 6, 0),
+                Cursor = Cursors.Hand
+            };
+            btnStart.FlatAppearance.BorderSize = 0;
+            btnStart.FlatAppearance.MouseOverBackColor = accent2;
+            btnStart.Click += BtnStart_Click;
+            btnStop = new Button
+            {
+                Text = "⏸️  ОСТАНОВИТЬ",
+                Dock = DockStyle.Fill,
+                BackColor = surface2,
+                ForeColor = ink,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 10F, FontStyle.Bold),
+                Margin = new Padding(6, 0, 0, 0),
+                Enabled = false,
+                Cursor = Cursors.Hand
+            };
+            btnStop.FlatAppearance.BorderSize = 0;
+            btnStop.FlatAppearance.MouseOverBackColor = Color.FromArgb(52, 72, 87);
+            btnStop.Click += BtnStop_Click;
+            lblStatus = new Label
+            {
+                Text = "● Остановлено",
+                Dock = DockStyle.Fill,
+                Font = new Font("Segoe UI", 10F, FontStyle.Bold),
+                ForeColor = muted,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(4, 10, 0, 0),
+                Tag = "status"
+            };
+            actionsLayout.Controls.Add(btnStart, 0, 0);
+            actionsLayout.Controls.Add(btnStop, 1, 0);
+            actionsLayout.Controls.Add(lblStatus, 0, 1);
+            actionsLayout.SetColumnSpan(lblStatus, 2);
+            actionsCard.Controls.Add(actionsLayout);
+            sidebar.Controls.Add(actionsCard, 0, 2);
+
+            var rightPanel = new Panel { Dock = DockStyle.Fill, BackColor = background };
+            var rightLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 1,
+                RowCount = 2,
+                Margin = Padding.Empty
+            };
+            rightLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 122));
+            rightLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+            var metricRow = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 3,
+                Margin = new Padding(0, 0, 0, 12)
+            };
+            metricRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33F));
+            metricRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33F));
+            metricRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.34F));
+
+            var metricCards = new[]
+            {
+                new { Title = "Общее время", Value = "00:00:00", Icon = "⏱️", Accent = accent },
+                new { Title = "Активных приложений", Value = "0", Icon = "📊", Accent = accent2 },
+                new { Title = "Сегодня", Value = DateTime.Now.ToString("dd MMM yyyy"), Icon = "📅", Accent = Color.FromArgb(157, 120, 205) }
+            };
+
+            for (int metricIndex = 0; metricIndex < metricCards.Length; metricIndex++)
+            {
+                var card = metricCards[metricIndex];
+                var metric = new Panel
+                {
+                    Dock = DockStyle.Fill,
+                    BackColor = surface,
+                    Margin = new Padding(0, 0, 10, 0),
+                    Padding = new Padding(10, 8, 8, 8)
+                };
+                metric.Tag = "surface";
+                var metricLayout = new TableLayoutPanel
+                {
+                    Dock = DockStyle.Fill,
+                    ColumnCount = 2,
+                    RowCount = 1,
+                    Margin = Padding.Empty
+                };
+                metricLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 36F));
+                metricLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+                metricLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+                var icon = new Label
+                {
+                    Text = card.Icon,
+                    ForeColor = card.Accent,
+                    Font = new Font("Segoe UI Emoji", 19F, FontStyle.Regular),
+                    Dock = DockStyle.Fill,
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Margin = Padding.Empty
+                };
+                var metricText = new TableLayoutPanel
+                {
+                    Dock = DockStyle.Fill,
+                    ColumnCount = 1,
+                    RowCount = 2,
+                    Margin = Padding.Empty
+                };
+                metricText.RowStyles.Add(new RowStyle(SizeType.Percent, 62F));
+                metricText.RowStyles.Add(new RowStyle(SizeType.Percent, 38F));
+                var value = new Label
+                {
+                    Text = card.Value,
+                    Dock = DockStyle.Fill,
+                    AutoEllipsis = true,
+                    Font = new Font("Segoe UI", card.Title == "Сегодня" ? 13F : 16F, FontStyle.Bold),
+                    ForeColor = ink,
+                    TextAlign = ContentAlignment.BottomLeft,
+                    Margin = Padding.Empty
+                };
+                if (card.Title == "Общее время")
+                {
+                    lblTotalTimeValue = value;
+                }
+                else if (card.Title == "Активных приложений")
+                {
+                    lblActiveAppsValue = value;
+                }
+                var label = new Label
+                {
+                    Text = card.Title,
+                    Dock = DockStyle.Fill,
+                    AutoEllipsis = true,
+                    Font = new Font("Segoe UI", 8.5F),
+                    ForeColor = muted,
+                    TextAlign = ContentAlignment.TopLeft,
+                    Margin = Padding.Empty
+                };
+                metricText.Controls.Add(value, 0, 0);
+                metricText.Controls.Add(label, 0, 1);
+                metricLayout.Controls.Add(icon, 0, 0);
+                metricLayout.Controls.Add(metricText, 1, 0);
+                metric.Controls.Add(metricLayout);
+                metricRow.Controls.Add(metric, metricIndex, 0);
+            }
+
+            rightLayout.Controls.Add(metricRow, 0, 0);
+
+            var reportPanel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = surface,
+                Padding = new Padding(18, 14, 18, 12)
+            };
+            reportPanel.Tag = "surface";
+            var reportLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = surface,
+                ColumnCount = 1,
+                RowCount = 3,
+                Margin = Padding.Empty
+            };
+            reportLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 70));
+            reportLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 280));
+            reportLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+            var reportHeader = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = surface,
+                Margin = Padding.Empty
+            };
+            var reportIcon = new Label
+            {
+                Text = "📈",
+                Font = new Font("Segoe UI Emoji", 17F, FontStyle.Regular),
+                ForeColor = accent,
+                TextAlign = ContentAlignment.MiddleCenter,
+                Margin = Padding.Empty
+            };
+            var reportTitle = new Label
+            {
+                Text = "Статистика использования",
+                Font = new Font("Segoe UI", 13F, FontStyle.Bold),
+                ForeColor = cardTitle,
+                TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                Margin = Padding.Empty
+            };
+            lblUsageSummary = new Label
+            {
+                Font = new Font("Segoe UI", 8.5F),
+                ForeColor = muted,
+                AutoEllipsis = true,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Margin = Padding.Empty,
+                Tag = "muted"
+            };
+            var tabs = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                BackColor = isDarkTheme ? Color.FromArgb(26, 40, 53) : Color.FromArgb(232, 238, 245),
+                Margin = Padding.Empty,
+                Padding = new Padding(3),
+                Height = 36,
+                Width = 260,
+                Anchor = AnchorStyles.Top | AnchorStyles.Right
+            };
+            var tabButtons = new[] { "Сегодня", "7 дней", "30 дней", "Год" };
+            int[] tabWidths = { 76, 58, 64, 46 };
+            for (int i = 0; i < tabButtons.Length; i++)
+            {
+                string tab = tabButtons[i];
+                var btn = new Button
+                {
+                    Text = tab,
+                    Width = tabWidths[i],
+                    Height = 28,
+                    FlatStyle = FlatStyle.Flat,
+                    BackColor = tab == "Сегодня" ? accent : Color.FromArgb(26, 40, 53),
+                    ForeColor = tab == "Сегодня" ? Color.FromArgb(7, 18, 26) : muted,
+                    Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+                    Margin = new Padding(1, 0, 1, 0),
+                    Padding = Padding.Empty,
+                    Cursor = Cursors.Hand,
+                    UseVisualStyleBackColor = false,
+                    Tag = "period-button"
+                };
+                btn.FlatAppearance.BorderSize = 0;
+                btn.FlatAppearance.MouseOverBackColor = Color.FromArgb(48, 204, 185);
+                btn.Click += (_, _) =>
+                {
+                    usagePeriod = tab;
+                    UpdateUsagePeriodButtons();
+                    UpdateUsageSummary();
+                    usageChart?.Invalidate();
+                    UpdateStatsTable();
+                };
+                usagePeriodButtons.Add(btn);
+                tabs.Controls.Add(btn);
+            }
+            reportHeader.Controls.Add(reportTitle);
+            reportHeader.Controls.Add(reportIcon);
+            reportHeader.Controls.Add(tabs);
+            reportHeader.Resize += (_, _) =>
+            {
+                tabs.Location = new Point(Math.Max(0, reportHeader.ClientSize.Width - tabs.Width), 2);
+                reportIcon.SetBounds(0, 0, 30, 34);
+                reportTitle.SetBounds(34, 0, Math.Max(0, tabs.Left - 40), 34);
+                lblUsageSummary.SetBounds(34, 35, Math.Max(0, reportHeader.ClientSize.Width - 38), 30);
+            };
+            reportHeader.Controls.Add(lblUsageSummary);
+            reportHeader.PerformLayout();
+            reportLayout.Controls.Add(reportHeader, 0, 0);
+
+            usageChart = new SmoothPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.FromArgb(17, 28, 38),
+                Margin = Padding.Empty
+            };
+            usageChart.Paint += UsageChart_Paint;
+            reportLayout.Controls.Add(usageChart, 0, 1);
+
+            var statsTableContainer = new Panel { Dock = DockStyle.Fill, BackColor = Color.Transparent, Padding = new Padding(0, 8, 0, 0) };
+            dgvStats = new SmoothDataGridView
+            {
+                Dock = DockStyle.Fill,
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+                AllowUserToAddRows = false,
+                AllowUserToDeleteRows = false,
+                AllowUserToResizeRows = false,
+                AllowUserToResizeColumns = false,
+                ReadOnly = true,
+                RowHeadersVisible = false,
+                BackgroundColor = surface,
+                BorderStyle = BorderStyle.None,
+                AllowUserToOrderColumns = false,
+                EnableHeadersVisualStyles = false,
+                ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None,
+                CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal,
+                GridColor = grid,
+                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                MultiSelect = false,
+                Font = new Font("Segoe UI", 10F),
+                ColumnHeadersHeight = 40,
+                ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing,
+                RowTemplate = { Height = 36 },
+                Margin = Padding.Empty,
+                ScrollBars = ScrollBars.Vertical
+            };
+            dgvStats.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(23, 36, 48);
+            dgvStats.ColumnHeadersDefaultCellStyle.ForeColor = ink;
+            dgvStats.ColumnHeadersDefaultCellStyle.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
+            dgvStats.DefaultCellStyle.BackColor = surface;
+            dgvStats.DefaultCellStyle.ForeColor = ink;
+            dgvStats.DefaultCellStyle.SelectionBackColor = Color.FromArgb(35, 71, 79);
+            dgvStats.DefaultCellStyle.SelectionForeColor = Color.FromArgb(245, 250, 252);
+            dgvStats.AlternatingRowsDefaultCellStyle.BackColor = rowEven;
+            dgvStats.AlternatingRowsDefaultCellStyle.ForeColor = ink;
+            dgvStats.AlternatingRowsDefaultCellStyle.SelectionBackColor = Color.FromArgb(35, 71, 79);
+            dgvStats.AlternatingRowsDefaultCellStyle.SelectionForeColor = Color.FromArgb(245, 250, 252);
+            dgvStats.ColumnCount = 5;
+            dgvStats.Columns[0].Name = "Приложение";
+            dgvStats.Columns[1].Name = "Статус";
+            dgvStats.Columns[2].Name = "Сессия";
+            dgvStats.Columns[3].Name = "За период";
+            dgvStats.Columns[4].Name = "Доля";
+            dgvStats.Columns[3].ToolTipText = "Время использования приложения за выбранный период. История по каждому приложению собирается после обновления.";
+            dgvStats.Columns[4].ToolTipText = "Доля времени приложения от суммарного времени за выбранный период";
+            statsTableContainer.Controls.Add(dgvStats);
+            reportLayout.Controls.Add(statsTableContainer, 0, 2);
+            reportPanel.Controls.Add(reportLayout);
+            rightLayout.Controls.Add(reportPanel, 0, 1);
+            rightPanel.Controls.Add(rightLayout);
+            content.Controls.Add(rightPanel, 1, 0);
+
+            Controls.Add(root);
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            ApplyNativeControlTheme();
+        }
+
+        private void ThemeButton_Paint(object? sender, PaintEventArgs e)
+        {
+            Color iconColor = isDarkTheme
+                ? Color.FromArgb(245, 190, 75)
+                : Color.FromArgb(75, 96, 123);
+            using var pen = new Pen(iconColor, 1.7F)
+            {
+                StartCap = System.Drawing.Drawing2D.LineCap.Round,
+                EndCap = System.Drawing.Drawing2D.LineCap.Round
+            };
+            Graphics graphics = e.Graphics;
+            graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            float centerX = btnTheme.ClientSize.Width / 2F;
+            float centerY = btnTheme.ClientSize.Height / 2F;
+
+            if (isDarkTheme)
+            {
+                graphics.DrawEllipse(pen, centerX - 4, centerY - 4, 8, 8);
+                for (int ray = 0; ray < 8; ray++)
+                {
+                    double angle = ray * Math.PI / 4;
+                    float innerX = centerX + (float)Math.Cos(angle) * 7;
+                    float innerY = centerY + (float)Math.Sin(angle) * 7;
+                    float outerX = centerX + (float)Math.Cos(angle) * 10;
+                    float outerY = centerY + (float)Math.Sin(angle) * 10;
+                    graphics.DrawLine(pen, innerX, innerY, outerX, outerY);
+                }
+            }
+            else
+            {
+                using var moonBrush = new SolidBrush(iconColor);
+                using var cutoutBrush = new SolidBrush(btnTheme.BackColor);
+                graphics.FillEllipse(moonBrush, centerX - 8, centerY - 9, 17, 18);
+                graphics.FillEllipse(cutoutBrush, centerX - 1, centerY - 11, 16, 18);
+            }
+        }
+
+        private void ApplyTheme()
+        {
+            Color background = isDarkTheme ? Color.FromArgb(15, 23, 32) : Color.FromArgb(243, 246, 250);
+            Color surface = isDarkTheme ? Color.FromArgb(25, 36, 48) : Color.White;
+            Color raisedSurface = isDarkTheme ? Color.FromArgb(31, 45, 59) : Color.FromArgb(232, 238, 245);
+            Color ink = isDarkTheme ? Color.FromArgb(232, 239, 246) : Color.FromArgb(29, 41, 57);
+            Color muted = isDarkTheme ? Color.FromArgb(148, 164, 180) : Color.FromArgb(102, 112, 133);
+            Color accent = isDarkTheme ? Color.FromArgb(35, 183, 166) : Color.FromArgb(22, 143, 131);
+            Color accentHover = isDarkTheme ? Color.FromArgb(48, 204, 185) : Color.FromArgb(17, 121, 111);
+            Color gridLine = isDarkTheme ? Color.FromArgb(42, 56, 70) : Color.FromArgb(220, 227, 234);
+            Color selection = isDarkTheme ? Color.FromArgb(35, 71, 79) : Color.FromArgb(201, 238, 233);
+            Color selectionInk = isDarkTheme ? Color.FromArgb(245, 250, 252) : Color.FromArgb(22, 60, 58);
+            Color danger = isDarkTheme ? Color.FromArgb(232, 105, 117) : Color.FromArgb(180, 35, 24);
+            Color dangerSurface = isDarkTheme ? Color.FromArgb(65, 39, 49) : Color.FromArgb(253, 232, 231);
+
+            BackColor = background;
+            ApplyThemeToControl(this, background, background, surface, raisedSurface, ink, muted);
+
+            btnAddProcess.BackColor = accent;
+            btnAddProcess.ForeColor = isDarkTheme ? Color.FromArgb(10, 28, 32) : Color.White;
+            btnAddProcess.FlatAppearance.MouseOverBackColor = accentHover;
+
+            btnStart.BackColor = accent;
+            btnStart.ForeColor = isDarkTheme ? Color.FromArgb(10, 28, 32) : Color.White;
+            btnStart.FlatAppearance.MouseOverBackColor = accentHover;
+
+            btnStop.BackColor = raisedSurface;
+            btnStop.ForeColor = ink;
+            btnStop.FlatAppearance.MouseOverBackColor = isDarkTheme
+                ? Color.FromArgb(48, 64, 80)
+                : Color.FromArgb(217, 226, 236);
+
+            btnRemoveProcess.BackColor = dangerSurface;
+            btnRemoveProcess.ForeColor = danger;
+            btnRemoveProcess.FlatAppearance.MouseOverBackColor = isDarkTheme
+                ? Color.FromArgb(82, 45, 57)
+                : Color.FromArgb(251, 213, 209);
+
+            btnTheme.BackColor = background;
+            btnTheme.FlatAppearance.MouseOverBackColor = raisedSurface;
+            btnTheme.Invalidate();
+
+            dgvStats.BackgroundColor = surface;
+            dgvStats.GridColor = gridLine;
+            dgvStats.ColumnHeadersDefaultCellStyle.BackColor = raisedSurface;
+            dgvStats.ColumnHeadersDefaultCellStyle.ForeColor = ink;
+            dgvStats.ColumnHeadersDefaultCellStyle.SelectionBackColor = raisedSurface;
+            dgvStats.ColumnHeadersDefaultCellStyle.SelectionForeColor = ink;
+            dgvStats.DefaultCellStyle.BackColor = surface;
+            dgvStats.DefaultCellStyle.ForeColor = ink;
+            dgvStats.DefaultCellStyle.SelectionBackColor = selection;
+            dgvStats.DefaultCellStyle.SelectionForeColor = selectionInk;
+            dgvStats.AlternatingRowsDefaultCellStyle.BackColor = isDarkTheme
+                ? Color.FromArgb(28, 40, 53)
+                : Color.FromArgb(247, 249, 252);
+            dgvStats.AlternatingRowsDefaultCellStyle.ForeColor = ink;
+            dgvStats.AlternatingRowsDefaultCellStyle.SelectionBackColor = selection;
+            dgvStats.AlternatingRowsDefaultCellStyle.SelectionForeColor = selectionInk;
+
+            UpdateStatusColor();
+            UpdateUsagePeriodButtons();
+            UpdateUsageSummary();
+            UpdateSummaryMetrics();
+            UpdateStatsTable();
+        }
+
+        private void ApplyThemeToControl(
+            Control control,
+            Color inheritedBackground,
+            Color background,
+            Color surface,
+            Color raisedSurface,
+            Color ink,
+            Color muted)
+        {
+            Color controlBackground = control.Tag as string == "surface"
+                ? surface
+                : control.Tag as string == "header"
+                    ? background
+                    : inheritedBackground;
+            control.BackColor = controlBackground;
+
+            if (control is Label label)
+            {
+                label.ForeColor = label.Tag as string == "muted" ? muted : ink;
+            }
+            else if (control is TextBox)
+            {
+                control.BackColor = raisedSurface;
+                control.ForeColor = ink;
+            }
+            else if (control is ListBox)
+            {
+                control.BackColor = surface;
+                control.ForeColor = ink;
+            }
+            else if (control is Button periodButton && periodButton.Tag as string == "period-button")
+            {
+                bool selected = periodButton.Text == usagePeriod;
+                periodButton.BackColor = selected
+                    ? isDarkTheme ? Color.FromArgb(38, 191, 191) : Color.FromArgb(22, 143, 131)
+                    : isDarkTheme ? Color.FromArgb(26, 40, 53) : Color.FromArgb(232, 238, 245);
+                periodButton.ForeColor = selected
+                    ? Color.White
+                    : isDarkTheme ? Color.FromArgb(196, 209, 222) : Color.FromArgb(62, 77, 94);
+            }
+            else if (control is Button button && button != btnTheme)
+            {
+                button.ForeColor = ink;
+            }
+
+            foreach (Control child in control.Controls)
+            {
+                ApplyThemeToControl(child, controlBackground, background, surface, raisedSurface, ink, muted);
+            }
+        }
+
+        private void UpdateStatusColor()
+        {
+            bool isSuccess = lblStatus.Text.Contains("активно", StringComparison.OrdinalIgnoreCase)
+                || lblStatus.Text.StartsWith("Сохранено", StringComparison.OrdinalIgnoreCase);
+            lblStatus.ForeColor = isSuccess
+                ? isDarkTheme ? Color.FromArgb(71, 211, 159) : Color.FromArgb(18, 126, 87)
+                : isDarkTheme ? Color.FromArgb(148, 164, 180) : Color.FromArgb(102, 112, 133);
+        }
+
+        private void ApplyNativeControlTheme()
+        {
+            SetNativeControlTheme(lstProcesses);
+            SetNativeControlTheme(dgvStats);
+        }
+
+        private void SetNativeControlTheme(Control control)
+        {
+            string? themeName = isDarkTheme ? "DarkMode_Explorer" : null;
+            SetWindowTheme(control.Handle, themeName, null);
+            EnumChildWindows(control.Handle, (childHandle, _) =>
+            {
+                SetWindowTheme(childHandle, themeName, null);
+                return true;
+            }, IntPtr.Zero);
+            control.Invalidate(true);
+        }
+
+        private void BtnAddProcess_Click(object sender, EventArgs e)
+        {
+            using var dialog = new OpenFileDialog
+            {
+                Title = "Выберите приложение для отслеживания",
+                Filter = "Приложения (*.exe)|*.exe|Все файлы (*.*)|*.*",
+                DefaultExt = "exe",
+                CheckFileExists = true,
+                Multiselect = false,
+                RestoreDirectory = true
+            };
+
+            if (dialog.ShowDialog(this) != DialogResult.OK)
+            {
+                return;
+            }
+
+            string processName = Path.GetFileNameWithoutExtension(dialog.FileName).Trim();
+            if (string.IsNullOrWhiteSpace(processName))
+            {
+                MessageBox.Show("Не удалось определить имя процесса по выбранному файлу.", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (!trackedProcesses.ContainsKey(processName))
+            {
+                trackedProcesses[processName] = new ProcessTracker(processName);
+                UpdateProcessList();
+                SaveAllData();
+            }
+            else
+            {
+                MessageBox.Show("Эта программа уже отслеживается!", "Предупреждение", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void BtnRemoveProcess_Click(object sender, EventArgs e)
+        {
+            int selectedIndex = lstProcesses.SelectedIndex;
+            if (selectedIndex >= 0 && selectedIndex < trackedProcesses.Count)
+            {
+                string process = trackedProcesses.Values.ElementAt(selectedIndex).ProcessName;
+
+                if (MessageBox.Show($"Удалить '{process}'?", "Подтверждение", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                {
+                    trackedProcesses.Remove(process);
+                    UpdateProcessList();
+                    SaveAllData();
+                }
+            }
+        }
+
+        private void LstProcesses_DrawItem(object? sender, DrawItemEventArgs e)
+        {
+            if (e.Index < 0 || e.Index >= trackedProcesses.Count)
+            {
+                return;
+            }
+
+            var tracker = trackedProcesses.Values.ElementAt(e.Index);
+            bool selected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
+            bool dark = isDarkTheme;
+            Color text = dark ? Color.FromArgb(229, 237, 244) : Color.FromArgb(31, 43, 58);
+            Color muted = dark ? Color.FromArgb(114, 139, 162) : Color.FromArgb(111, 126, 144);
+            Color accent = dark ? Color.FromArgb(41, 207, 204) : Color.FromArgb(19, 151, 139);
+            Color itemBackground = selected
+                ? dark ? Color.FromArgb(31, 51, 65) : Color.FromArgb(225, 238, 245)
+                : lstProcesses.BackColor;
+            Rectangle row = new(e.Bounds.Left + 1, e.Bounds.Top + 1, Math.Max(0, e.Bounds.Width - 3), e.Bounds.Height - 2);
+
+            using (var listBackgroundBrush = new SolidBrush(lstProcesses.BackColor))
+            {
+                e.Graphics.FillRectangle(listBackgroundBrush, e.Bounds);
+            }
+            if (selected)
+            {
+                e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                using (var backgroundBrush = new SolidBrush(itemBackground))
+                using (var path = CreateRoundedRectangle(row, 7))
+                {
+                    e.Graphics.FillPath(backgroundBrush, path);
+                }
+            }
+
+            Rectangle statusBounds = new(row.Left + 8, row.Top + (row.Height - 14) / 2, 14, 14);
+            Color statusColor = tracker.IsRunning ? accent : muted;
+            using (var statusPen = new Pen(statusColor, 1.5F))
+            using (var activeBrush = new SolidBrush(statusColor))
+            {
+                if (tracker.IsRunning)
+                {
+                    e.Graphics.FillEllipse(activeBrush, statusBounds);
+                }
+                else
+                {
+                    e.Graphics.DrawEllipse(statusPen, statusBounds);
+                }
+            }
+
+            using (var textBrush = new SolidBrush(text))
+            using (var font = new Font("Segoe UI", 9.5F, FontStyle.Regular))
+            {
+                Rectangle textBounds = new(statusBounds.Right + 10, row.Top, Math.Max(0, row.Right - statusBounds.Right - 42), row.Height);
+                TextRenderer.DrawText(e.Graphics, tracker.ProcessName + ".exe", font, textBounds, text,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine);
+            }
+
+        }
+
+        private static System.Drawing.Drawing2D.GraphicsPath CreateRoundedRectangle(Rectangle bounds, int radius)
+        {
+            var path = new System.Drawing.Drawing2D.GraphicsPath();
+            int diameter = Math.Min(radius * 2, Math.Min(bounds.Width, bounds.Height));
+            Rectangle arc = new(bounds.Left, bounds.Top, diameter, diameter);
+            path.AddArc(arc, 180, 90);
+            arc.X = bounds.Right - diameter;
+            path.AddArc(arc, 270, 90);
+            arc.Y = bounds.Bottom - diameter;
+            path.AddArc(arc, 0, 90);
+            arc.X = bounds.Left;
+            path.AddArc(arc, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        private void LstProcesses_MouseDown(object? sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Right)
+            {
+                int index = lstProcesses.IndexFromPoint(e.Location);
+                if (index >= 0)
+                {
+                    lstProcesses.SelectedIndex = index;
+                }
+            }
+        }
+
+        private void UpdateProcessList()
+        {
+            int selectedIndex = lstProcesses.SelectedIndex;
+            lstProcesses.Items.Clear();
+            displayedProcessStates.Clear();
+            foreach (var tracker in trackedProcesses.Values)
+            {
+                lstProcesses.Items.Add(tracker.ProcessName);
+                displayedProcessStates[tracker.ProcessName] = tracker.IsRunning;
+            }
+            if (lstProcesses.Items.Count > 0)
+            {
+                lstProcesses.SelectedIndex = Math.Clamp(selectedIndex, 0, lstProcesses.Items.Count - 1);
+            }
+            UpdateSummaryMetrics();
+            UpdateStatsTable();
+        }
+
+        private void UpdateProcessStatuses()
+        {
+            if (lstProcesses.InvokeRequired)
+            {
+                lstProcesses.Invoke(new Action(UpdateProcessStatuses));
+                return;
+            }
+
+            int index = 0;
+            foreach (var tracker in trackedProcesses.Values)
+            {
+                if (!displayedProcessStates.TryGetValue(tracker.ProcessName, out bool wasRunning)
+                    || wasRunning != tracker.IsRunning)
+                {
+                    displayedProcessStates[tracker.ProcessName] = tracker.IsRunning;
+                    if (index < lstProcesses.Items.Count)
+                    {
+                        lstProcesses.Invalidate(lstProcesses.GetItemRectangle(index));
+                    }
+                }
+                index++;
+            }
+        }
+
+        private void BtnStart_Click(object sender, EventArgs e)
+        {
+            if (trackedProcesses.Count == 0)
+            {
+                MessageBox.Show("Добавьте хотя бы одну программу!", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            isTracking = true;
+
+            checkTimer = new System.Windows.Forms.Timer();
+            checkTimer.Interval = 1000;
+            checkTimer.Tick += CheckAllProcesses;
+            checkTimer.Start();
+
+            refreshTimer = new System.Windows.Forms.Timer();
+            refreshTimer.Interval = 250;
+            refreshTimer.Tick += RefreshTimer_Tick;
+            refreshTimer.Start();
+            lastDetailedUiUpdate = DateTime.MinValue;
+
+            autoSaveTimer = new System.Windows.Forms.Timer();
+            autoSaveTimer.Interval = 30000;
+            autoSaveTimer.Tick += AutoSaveTimer_Tick;
+            autoSaveTimer.Start();
+            lastUsageSampleUtc = null;
+            lastSampleActiveProcesses = Array.Empty<string>();
+
+            btnStart.Enabled = false;
+            btnStop.Enabled = true;
+            btnAddProcess.Enabled = false;
+            btnRemoveProcess.Enabled = false;
+
+            lblStatus.Text = "●  Отслеживание активно";
+            UpdateStatusColor();
+            CheckAllProcesses(this, EventArgs.Empty);
+            UpdateProcessStatuses();
+            UpdateStatsTable();
+        }
+
+        private void BtnStop_Click(object sender, EventArgs e)
+        {
+            RecordUsageUntilNow();
+            isTracking = false;
+
+            if (checkTimer != null)
+            {
+                checkTimer.Stop();
+                checkTimer.Dispose();
+                checkTimer = null;
+            }
+
+            if (refreshTimer != null)
+            {
+                refreshTimer.Stop();
+                refreshTimer.Dispose();
+                refreshTimer = null;
+            }
+
+            autoSaveTimer?.Stop();
+            autoSaveTimer?.Dispose();
+            autoSaveTimer = null;
+
+            foreach (var tracker in trackedProcesses.Values)
+            {
+                tracker.PauseTracking();
+            }
+
+            btnStart.Enabled = true;
+            btnStop.Enabled = false;
+            btnAddProcess.Enabled = true;
+            btnRemoveProcess.Enabled = true;
+
+            lblStatus.Text = "●  Остановлено";
+            UpdateStatusColor();
+            UpdateProcessStatuses();
+            UpdateSummaryMetrics();
+            UpdateStatsTable();
+
+            SaveAllData();
+            SaveUsageHistory();
+            SaveStatsToTxt();
+        }
+
+        private void AutoSaveTimer_Tick(object? sender, EventArgs e)
+        {
+            SaveAllData();
+            SaveUsageHistory();
+        }
+
+        private void SaveAllData()
+        {
+            try
+            {
+                using (StreamWriter writer = new StreamWriter(dataFile, false))
+                {
+                    foreach (var tracker in trackedProcesses.Values)
+                    {
+                        TimeSpan totalTime = tracker.TotalTime + tracker.GetCurrentSessionTime();
+                        writer.WriteLine($"{tracker.ProcessName}|{totalTime.TotalSeconds.ToString("R", CultureInfo.InvariantCulture)}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка сохранения данных: {ex.Message}");
+            }
+        }
+
+        private void LoadAllData()
+        {
+            LoadUsageHistory();
+            if (!File.Exists(dataFile))
+                return;
+
+            try
+            {
+                string[] lines = File.ReadAllLines(dataFile);
+                foreach (string line in lines)
+                {
+                    string[] parts = line.Split('|');
+                    if (parts.Length == 2)
+                    {
+                        string processName = parts[0];
+                        if (TryParseSavedSeconds(parts[1], out double seconds))
+                        {
+                            ProcessTracker tracker = new ProcessTracker(processName);
+                            tracker.TotalTime = TimeSpan.FromSeconds(seconds);
+                            trackedProcesses[processName] = tracker;
+                        }
+                    }
+                }
+                UpdateProcessList();
+                UpdateSummaryMetrics();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка загрузки данных: {ex.Message}");
+            }
+        }
+
+        private static bool TryParseSavedSeconds(string value, out double seconds)
+        {
+            string normalized = value.Contains(',') && !value.Contains('.')
+                ? value.Replace(',', '.')
+                : value;
+
+            return double.TryParse(normalized, NumberStyles.Float, CultureInfo.InvariantCulture, out seconds)
+                && double.IsFinite(seconds)
+                && seconds >= 0;
+        }
+
+        private void SaveStatsToTxt()
+        {
+            try
+            {
+                using (StreamWriter writer = new StreamWriter("Stats.txt", false, System.Text.Encoding.UTF8))
+                {
+                    writer.WriteLine($"Статистика от {DateTime.Now:dd.MM.yyyy HH:mm:ss}");
+                    writer.WriteLine(new string('-', 40));
+
+                    foreach (var tracker in trackedProcesses.Values)
+                    {
+                        writer.WriteLine($"{tracker.ProcessName}.exe");
+                        TimeSpan totalTime = tracker.TotalTime + tracker.GetCurrentSessionTime();
+                        writer.WriteLine($"Общее время: {FormatDuration(totalTime)} ({totalTime.TotalMinutes:F1} минут)");
+                        writer.WriteLine($"Текущая сессия: {FormatDuration(tracker.GetCurrentSessionTime())}");
+                        writer.WriteLine();
+                    }
+
+                    writer.WriteLine(new string('-', 40));
+                    writer.WriteLine($"Всего программ: {trackedProcesses.Count}");
+                }
+
+                lblStatus.Text = $"Сохранено в Stats.txt";
+                UpdateStatusColor();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Ошибка: {ex.Message}", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void CheckAllProcesses(object sender, EventArgs e)
+        {
+            if (!isTracking) return;
+
+            RecordUsageUntilNow();
+            bool needSave = false;
+            foreach (var tracker in trackedProcesses.Values)
+            {
+                bool wasRunning = tracker.IsRunning;
+                tracker.CheckProcess();
+                if (wasRunning != tracker.IsRunning && !tracker.IsRunning)
+                {
+                    needSave = true;
+                }
+            }
+
+            if (needSave)
+            {
+                SaveAllData();
+            }
+
+            lastUsageSampleUtc = DateTime.UtcNow;
+            lastSampleActiveProcesses = trackedProcesses.Values
+                .Where(tracker => tracker.IsRunning)
+                .Select(tracker => tracker.ProcessName)
+                .ToArray();
+            UpdateSummaryMetrics();
+        }
+
+        private void RefreshTimer_Tick(object sender, EventArgs e)
+        {
+            if (!isTracking) return;
+
+            UpdateSummaryMetrics();
+            DateTime now = DateTime.UtcNow;
+            if (now - lastDetailedUiUpdate >= TimeSpan.FromSeconds(1))
+            {
+                lastDetailedUiUpdate = now;
+                UpdateProcessStatuses();
+                UpdateStatsTable();
+                usageChart?.Invalidate();
+            }
+        }
+
+        private void RecordUsageUntilNow()
+        {
+            if (!isTracking)
+            {
+                lastUsageSampleUtc = null;
+                return;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            if (lastUsageSampleUtc is DateTime previous && lastSampleActiveProcesses.Length > 0 && now > previous)
+            {
+                while (previous < now)
+                {
+                    DateTime hourStart = new(previous.Year, previous.Month, previous.Day, previous.Hour, 0, 0, DateTimeKind.Utc);
+                    DateTime nextHour = hourStart.AddHours(1);
+                    DateTime intervalEnd = now < nextHour ? now : nextHour;
+                    double seconds = (intervalEnd - previous).TotalSeconds;
+                    usageByHour[hourStart] = usageByHour.GetValueOrDefault(hourStart) + seconds;
+                    if (!usageByAppHour.TryGetValue(hourStart, out Dictionary<string, double>? appUsage))
+                    {
+                        appUsage = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+                        usageByAppHour[hourStart] = appUsage;
+                    }
+
+                    foreach (string processName in lastSampleActiveProcesses)
+                    {
+                        appUsage[processName] = appUsage.GetValueOrDefault(processName) + seconds;
+                    }
+                    previous = intervalEnd;
+                }
+            }
+
+            lastUsageSampleUtc = now;
+        }
+
+        private void SaveUsageHistory()
+        {
+            try
+            {
+                DateTime cutoff = DateTime.UtcNow.AddDays(-366);
+                foreach (DateTime oldHour in usageByHour.Keys.Where(hour => hour < cutoff).ToArray())
+                {
+                    usageByHour.Remove(oldHour);
+                }
+                foreach (DateTime oldHour in usageByAppHour.Keys.Where(hour => hour < cutoff).ToArray())
+                {
+                    usageByAppHour.Remove(oldHour);
+                }
+
+                using var writer = new StreamWriter(usageHistoryFile, false);
+                writer.WriteLine(UsageHistoryFormatMarker);
+                foreach (var entry in usageByHour.OrderBy(entry => entry.Key))
+                {
+                    writer.WriteLine($"{entry.Key:O}|{entry.Value.ToString("R", CultureInfo.InvariantCulture)}");
+                }
+
+                foreach (var hour in usageByAppHour.OrderBy(entry => entry.Key))
+                {
+                    foreach (var app in hour.Value.OrderBy(entry => entry.Key, StringComparer.OrdinalIgnoreCase))
+                    {
+                        writer.WriteLine($"{hour.Key:O}|{app.Key}|{app.Value.ToString("R", CultureInfo.InvariantCulture)}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка сохранения истории использования: {ex.Message}");
+            }
+        }
+
+        private void LoadUsageHistory()
+        {
+            if (!File.Exists(usageHistoryFile))
+            {
+                return;
+            }
+
+            try
+            {
+                DateTime cutoff = DateTime.UtcNow.AddDays(-366);
+                bool hasElapsedUnionFormat = false;
+                foreach (string line in File.ReadLines(usageHistoryFile))
+                {
+                    if (line == UsageHistoryFormatMarker)
+                    {
+                        hasElapsedUnionFormat = true;
+                        continue;
+                    }
+
+                    string[] parts = line.Split('|');
+                    if (parts.Length == 3
+                        && DateTime.TryParse(parts[0], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out DateTime appTimestamp)
+                        && double.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out double processSeconds)
+                        && double.IsFinite(processSeconds)
+                        && processSeconds >= 0)
+                    {
+                        DateTime appHour = new(appTimestamp.Year, appTimestamp.Month, appTimestamp.Day, appTimestamp.Hour, 0, 0, DateTimeKind.Utc);
+                        if (appHour >= cutoff)
+                        {
+                            if (!usageByAppHour.TryGetValue(appHour, out Dictionary<string, double>? appUsage))
+                            {
+                                appUsage = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+                                usageByAppHour[appHour] = appUsage;
+                            }
+
+                            appUsage[parts[1]] = appUsage.GetValueOrDefault(parts[1]) + processSeconds;
+                        }
+                        continue;
+                    }
+
+                    if (parts.Length != 2
+                        || !DateTime.TryParse(parts[0], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out DateTime timestamp)
+                        || !double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out double appSeconds)
+                        || !double.IsFinite(appSeconds)
+                        || appSeconds < 0)
+                    {
+                        continue;
+                    }
+
+                    DateTime hour = new(timestamp.Year, timestamp.Month, timestamp.Day, timestamp.Hour, 0, 0, DateTimeKind.Utc);
+                    if (hour >= cutoff)
+                    {
+                        usageByHour[hour] = usageByHour.GetValueOrDefault(hour) + appSeconds;
+                    }
+                }
+
+                if (!hasElapsedUnionFormat)
+                {
+                    foreach (DateTime hour in usageByHour.Keys.ToArray())
+                    {
+                        if (usageByAppHour.TryGetValue(hour, out Dictionary<string, double>? appUsage) && appUsage.Count > 0)
+                        {
+                            usageByHour[hour] = Math.Min(usageByHour[hour], appUsage.Values.Max());
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка загрузки истории использования: {ex.Message}");
+            }
+        }
+
+        private void UpdateUsagePeriodButtons()
+        {
+            foreach (Button button in usagePeriodButtons)
+            {
+                bool selected = button.Text == usagePeriod;
+                button.BackColor = selected
+                    ? isDarkTheme ? Color.FromArgb(38, 191, 191) : Color.FromArgb(22, 143, 131)
+                    : isDarkTheme ? Color.FromArgb(26, 40, 53) : Color.FromArgb(232, 238, 245);
+                button.ForeColor = selected
+                    ? Color.White
+                    : isDarkTheme ? Color.FromArgb(196, 209, 222) : Color.FromArgb(62, 77, 94);
+            }
+        }
+
+        private void UsageChart_Paint(object? sender, PaintEventArgs e)
+        {
+            Rectangle bounds = usageChart?.ClientRectangle ?? Rectangle.Empty;
+            if (bounds.Width < 100 || bounds.Height < 100)
+            {
+                return;
+            }
+
+            Graphics graphics = e.Graphics;
+            graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            Color gridColor = isDarkTheme ? Color.FromArgb(55, 73, 89) : Color.FromArgb(218, 227, 235);
+            Color textColor = isDarkTheme ? Color.FromArgb(144, 163, 178) : Color.FromArgb(94, 111, 128);
+            Color lineColor = isDarkTheme ? Color.FromArgb(58, 223, 205) : Color.FromArgb(22, 143, 131);
+            Rectangle plot = new(bounds.Left + 52, bounds.Top + 14, bounds.Width - 68, bounds.Height - 52);
+            if (plot.Width <= 0 || plot.Height <= 0)
+            {
+                return;
+            }
+
+            List<(string Label, double Value)> data = GetUsageChartData();
+            double maximum = data.Count == 0 ? 1 : data.Max(point => point.Value);
+            maximum = maximum <= 0 ? 1 : Math.Ceiling(maximum * 1.15);
+
+            using var gridPen = new Pen(gridColor, 1F);
+            using var axisFont = new Font("Segoe UI", 8.5F);
+            using var axisBrush = new SolidBrush(textColor);
+            for (int i = 0; i <= 4; i++)
+            {
+                float y = plot.Top + plot.Height * i / 4F;
+                graphics.DrawLine(gridPen, plot.Left, y, plot.Right, y);
+                double labelValue = maximum * (4 - i) / 4;
+                graphics.DrawString(labelValue.ToString("0.#", CultureInfo.CurrentCulture), axisFont, axisBrush, bounds.Left + 2, y - 8);
+            }
+
+            if (data.Count == 0 || data.All(point => point.Value <= 0))
+            {
+                using var emptyFont = new Font("Segoe UI", 10F);
+                string message = "Данных пока нет. Запустите отслеживание приложений.";
+                SizeF messageSize = graphics.MeasureString(message, emptyFont);
+                using var emptyBrush = new SolidBrush(textColor);
+                graphics.DrawString(message, emptyFont, emptyBrush,
+                    plot.Left + Math.Max(0, (plot.Width - messageSize.Width) / 2),
+                    plot.Top + plot.Height / 2 - messageSize.Height / 2);
+                return;
+            }
+
+            var points = new PointF[data.Count];
+            for (int i = 0; i < data.Count; i++)
+            {
+                float x = data.Count == 1
+                    ? plot.Left + plot.Width / 2F
+                    : plot.Left + i * plot.Width / (float)(data.Count - 1);
+                float y = plot.Bottom - (float)(data[i].Value / maximum * plot.Height);
+                points[i] = new PointF(x, y);
+            }
+
+            using var linePen = new Pen(lineColor, 2.5F);
+            using var dotBrush = new SolidBrush(lineColor);
+            if (points.Length > 1)
+            {
+                graphics.DrawLines(linePen, points);
+            }
+            foreach (PointF point in points)
+            {
+                graphics.FillEllipse(dotBrush, point.X - 3.5F, point.Y - 3.5F, 7F, 7F);
+            }
+
+            int labelStep = Math.Max(1, (int)Math.Ceiling(data.Count / 6.0));
+            for (int i = 0; i < data.Count; i += labelStep)
+            {
+                float x = points[i].X;
+                string label = data[i].Label;
+                SizeF labelSize = graphics.MeasureString(label, axisFont);
+                graphics.DrawString(label, axisFont, axisBrush,
+                    Math.Clamp(x - labelSize.Width / 2, plot.Left, plot.Right - labelSize.Width),
+                    plot.Bottom + 8);
+            }
+        }
+
+        private List<(string Label, double Value)> GetUsageChartData()
+        {
+            DateTime today = DateTime.Now.Date;
+            var hours = usageByHour
+                .Select(entry => (Time: entry.Key.ToLocalTime(), AppSeconds: entry.Value))
+                .ToArray();
+
+            if (usagePeriod == "Сегодня")
+            {
+                return Enumerable.Range(0, 24)
+                    .Select(hour =>
+                    {
+                        double seconds = hours
+                            .Where(entry => entry.Time.Date == today && entry.Time.Hour == hour)
+                            .Sum(entry => entry.AppSeconds);
+                        return ($"{hour:00}:00", seconds / 3600);
+                    })
+                    .ToList();
+            }
+
+            if (usagePeriod == "Год")
+            {
+                return Enumerable.Range(1, 12)
+                    .Select(month =>
+                    {
+                        double seconds = hours
+                            .Where(entry => entry.Time.Year == today.Year && entry.Time.Month == month)
+                            .Sum(entry => entry.AppSeconds);
+                        return (new DateTime(today.Year, month, 1).ToString("MMM", CultureInfo.CurrentCulture), seconds / 3600);
+                    })
+                    .ToList();
+            }
+
+            int dayCount = usagePeriod == "7 дней" ? 7 : 30;
+            return Enumerable.Range(0, dayCount)
+                .Select(offset =>
+                {
+                    DateTime day = today.AddDays(offset - dayCount + 1);
+                    double seconds = hours
+                        .Where(entry => entry.Time.Date == day)
+                        .Sum(entry => entry.AppSeconds);
+                    return (day.ToString("dd.MM"), seconds / 3600);
+                })
+                .ToList();
+        }
+
+        private double GetProcessUsageForSelectedPeriod(string processName)
+        {
+            DateTime now = DateTime.Now;
+            DateTime startDate = usagePeriod switch
+            {
+                "Сегодня" => now.Date,
+                "7 дней" => now.Date.AddDays(-6),
+                "30 дней" => now.Date.AddDays(-29),
+                _ => new DateTime(now.Year, 1, 1)
+            };
+            double seconds = 0;
+            foreach (var hour in usageByAppHour)
+            {
+                DateTime localHour = hour.Key.ToLocalTime();
+                if (localHour.Date >= startDate
+                    && localHour.Date <= now.Date
+                    && hour.Value.TryGetValue(processName, out double appSeconds))
+                {
+                    seconds += appSeconds;
+                }
+            }
+
+            if (isTracking
+                && lastUsageSampleUtc is DateTime lastSample
+                && lastSample.ToLocalTime().Date >= startDate
+                && lastSample.ToLocalTime().Date <= now.Date
+                && lastSampleActiveProcesses.Contains(processName, StringComparer.OrdinalIgnoreCase))
+            {
+                seconds += Math.Max(0, (DateTime.UtcNow - lastSample).TotalSeconds);
+            }
+
+            return seconds;
+        }
+
+        private double GetTodayUsageSeconds()
+        {
+            DateTime today = DateTime.Today;
+            double seconds = usageByHour
+                .Where(entry => entry.Key.ToLocalTime().Date == today)
+                .Sum(entry => entry.Value);
+
+            if (isTracking && lastUsageSampleUtc is DateTime lastSample && lastSampleActiveProcesses.Length > 0)
+            {
+                DateTime todayStartUtc = today.ToUniversalTime();
+                DateTime currentIntervalStart = lastSample > todayStartUtc ? lastSample : todayStartUtc;
+                seconds += Math.Max(0, (DateTime.UtcNow - currentIntervalStart).TotalSeconds);
+            }
+
+            return seconds;
+        }
+
+        private void UpdateSummaryMetrics()
+        {
+            if (lblTotalTimeValue == null || lblActiveAppsValue == null)
+            {
+                return;
+            }
+
+            TimeSpan totalTime = TimeSpan.FromSeconds(GetTodayUsageSeconds());
+            int activeCount = 0;
+            foreach (var tracker in trackedProcesses.Values)
+            {
+                if (tracker.IsRunning)
+                {
+                    activeCount++;
+                }
+            }
+
+            lblTotalTimeValue.Text = FormatDuration(totalTime);
+            lblActiveAppsValue.Text = activeCount.ToString();
+            UpdateUsageSummary(activeCount);
+        }
+
+        private void UpdateUsageSummary(int? activeCount = null)
+        {
+            if (lblUsageSummary == null)
+            {
+                return;
+            }
+
+            List<(string Label, double Value)> data = GetUsageChartData();
+            double totalHours = usagePeriod == "Сегодня"
+                ? GetTodayUsageSeconds() / 3600
+                : data.Sum(point => point.Value);
+            TimeSpan periodTime = TimeSpan.FromSeconds(totalHours * 3600);
+            int runningCount = activeCount ?? trackedProcesses.Values.Count(tracker => tracker.IsRunning);
+            string periodLabel = usagePeriod == "Сегодня" ? "сегодня" : usagePeriod.ToLowerInvariant();
+            lblUsageSummary.Text = $"За {periodLabel}: {FormatDuration(periodTime)} суммарно  ·  Сейчас запущено: {runningCount}";
+        }
+
+        private static string FormatDuration(TimeSpan duration, bool showTenths = false)
+        {
+            long totalHours = (long)duration.TotalHours;
+            string formatted = $"{totalHours:00}:{duration.Minutes:00}:{duration.Seconds:00}";
+            return showTenths ? $"{formatted}.{duration.Milliseconds / 100}" : formatted;
+        }
+
+        private void UpdateStatsTable()
+        {
+            if (dgvStats.InvokeRequired)
+            {
+                dgvStats.Invoke(new Action(UpdateStatsTable));
+                return;
+            }
+
+            if (dgvStats.Rows.Count != trackedProcesses.Count)
+            {
+                dgvStats.Rows.Clear();
+                if (trackedProcesses.Count > 0)
+                {
+                    dgvStats.Rows.Add(trackedProcesses.Count);
+                }
+            }
+
+            Dictionary<ProcessTracker, double> selectedPeriodUsage = trackedProcesses.Values
+                .ToDictionary(tracker => tracker, tracker => GetProcessUsageForSelectedPeriod(tracker.ProcessName));
+            double totalPeriodSeconds = selectedPeriodUsage.Values.Sum();
+            int rowIndex = 0;
+            foreach (var tracker in trackedProcesses.Values)
+            {
+                DataGridViewRow row = dgvStats.Rows[rowIndex++];
+                string status = tracker.IsRunning ? "Работает" : "Не активна";
+                SetCellValueIfChanged(row.Cells[0], tracker.ProcessName);
+                SetCellValueIfChanged(row.Cells[1], status);
+                SetCellValueIfChanged(row.Cells[2], FormatDuration(tracker.GetCurrentSessionTime()));
+                double processSeconds = selectedPeriodUsage[tracker];
+                SetCellValueIfChanged(row.Cells[3], FormatDuration(TimeSpan.FromSeconds(processSeconds)));
+                string percentage = totalPeriodSeconds > 0
+                    ? $"{processSeconds / totalPeriodSeconds * 100:F1}%"
+                    : "0.0%";
+                SetCellValueIfChanged(row.Cells[4], percentage);
+                Color surface = isDarkTheme
+                    ? Color.FromArgb(25, 36, 48)
+                    : Color.White;
+                Color ink = isDarkTheme
+                    ? Color.FromArgb(232, 239, 246)
+                    : Color.FromArgb(29, 41, 57);
+                Color selection = isDarkTheme
+                    ? Color.FromArgb(35, 71, 79)
+                    : Color.FromArgb(201, 238, 233);
+                Color rowBackground = tracker.IsRunning
+                    ? isDarkTheme ? Color.FromArgb(29, 66, 62) : Color.FromArgb(221, 243, 235)
+                    : rowIndex % 2 == 0
+                        ? isDarkTheme ? Color.FromArgb(28, 40, 53) : Color.FromArgb(247, 249, 252)
+                        : surface;
+                Color selectionInk = isDarkTheme
+                    ? Color.FromArgb(245, 250, 252)
+                    : Color.FromArgb(22, 60, 58);
+                if (row.DefaultCellStyle.BackColor != rowBackground)
+                {
+                    row.DefaultCellStyle.BackColor = rowBackground;
+                }
+                if (row.DefaultCellStyle.ForeColor != ink)
+                {
+                    row.DefaultCellStyle.ForeColor = ink;
+                }
+                if (row.DefaultCellStyle.SelectionBackColor != selection)
+                {
+                    row.DefaultCellStyle.SelectionBackColor = selection;
+                }
+                if (row.DefaultCellStyle.SelectionForeColor != selectionInk)
+                {
+                    row.DefaultCellStyle.SelectionForeColor = selectionInk;
+                }
+            }
+        }
+
+        private static void SetCellValueIfChanged(DataGridViewCell cell, object value)
+        {
+            if (!Equals(cell.Value, value))
+            {
+                cell.Value = value;
+            }
+        }
+
+        private sealed class SmoothListBox : ListBox
+        {
+            public SmoothListBox()
+            {
+                DoubleBuffered = true;
+                SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+                UpdateStyles();
+            }
+        }
+
+        private sealed class SmoothDataGridView : DataGridView
+        {
+            public SmoothDataGridView()
+            {
+                DoubleBuffered = true;
+                SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+                UpdateStyles();
+            }
+        }
+
+        private sealed class SmoothPanel : Panel
+        {
+            public SmoothPanel()
+            {
+                DoubleBuffered = true;
+                SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+                UpdateStyles();
+            }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            RecordUsageUntilNow();
+            SaveAllData();
+            SaveUsageHistory();
+            SaveStatsToTxt();
+            if (checkTimer != null) checkTimer.Dispose();
+            if (refreshTimer != null) refreshTimer.Dispose();
+            autoSaveTimer?.Stop();
+            autoSaveTimer?.Dispose();
+            base.OnFormClosing(e);
+        }
+    }
+
+    public class ProcessTracker
+    {
+        public string ProcessName { get; private set; }
+        public TimeSpan TotalTime { get; set; }
+        public bool IsRunning { get; private set; }
+        private readonly Stopwatch sessionStopwatch = new();
+
+        public ProcessTracker(string processName)
+        {
+            ProcessName = processName;
+            TotalTime = TimeSpan.Zero;
+            IsRunning = false;
+        }
+
+        public void CheckProcess()
+        {
+            try
+            {
+                Process[] processes = Process.GetProcessesByName(ProcessName);
+                bool currentlyRunning = processes.Length > 0;
+                foreach (Process process in processes)
+                {
+                    process.Dispose();
+                }
+
+                if (currentlyRunning && !IsRunning)
+                {
+                    sessionStopwatch.Restart();
+                    IsRunning = true;
+                }
+                else if (!currentlyRunning && IsRunning)
+                {
+                    TotalTime += sessionStopwatch.Elapsed;
+                    sessionStopwatch.Reset();
+                    IsRunning = false;
+                }
+            }
+            catch { }
+        }
+
+        public void PauseTracking()
+        {
+            if (IsRunning)
+            {
+                TotalTime += sessionStopwatch.Elapsed;
+            }
+
+            sessionStopwatch.Reset();
+            IsRunning = false;
+        }
+
+        public TimeSpan GetCurrentSessionTime()
+        {
+            return IsRunning ? sessionStopwatch.Elapsed : TimeSpan.Zero;
+        }
+    }
+}
